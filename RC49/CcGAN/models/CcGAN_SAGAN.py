@@ -125,6 +125,31 @@ class ConditionalBatchNorm2d(nn.Module):
         out = out + gamma * out + beta
         return out
 
+def match_teacher_feat(student_feat, teacher_feat_shape, use_conv=True):
+    """
+    将学生网络特征的通道数和空间尺寸对齐教师网络特征。
+
+    参数：
+        student_feat: 学生特征, shape为(B, C_s, H_s, W_s)
+        teacher_feat_shape: 教师特征的shape, (B, C_t, H_t, W_t)
+        use_conv: 是否使用卷积调整通道，若为False则仅插值上采样或下采样空间尺寸
+
+    返回：
+        调整后的学生特征，维度与教师特征一致。
+    """
+    B, C_t, H_t, W_t = teacher_feat_shape
+    _, C_s, H_s, W_s = student_feat.shape
+
+    # 空间尺寸对齐（插值）
+    if (H_s != H_t) or (W_s != W_t):
+        student_feat = F.interpolate(student_feat, size=(H_t, W_t), mode='bilinear', align_corners=True)
+
+    # 通道数对齐（卷积）
+    if use_conv and (C_s != C_t):
+        conv_layer = nn.Conv2d(C_s, C_t, kernel_size=1, stride=1, padding=0).to(student_feat.device)
+        student_feat = conv_layer(student_feat)
+
+    return student_feat
 
 # 生成器残差块（GenBlock），包含条件批归一化、ReLU激活、卷积和上采样
 class GenBlock(nn.Module):
@@ -234,7 +259,7 @@ class CcGAN_SAGAN_Generator(nn.Module):
 class CcGAN_SAGAN_Generator_Student(nn.Module):
     """学生生成器，通道减半；同时在 forward 中返回若干层特征，并用 1x1 conv 做通道对齐"""
 
-    def __init__(self, dim_z, dim_embed=128, nc=3, gene_ch=32):
+    def __init__(self, dim_z=256, dim_embed=128, nc=3, gene_ch=32):
         super(CcGAN_SAGAN_Generator_Student, self).__init__()
         self.dim_z = dim_z
         self.gene_ch = gene_ch
@@ -254,23 +279,26 @@ class CcGAN_SAGAN_Generator_Student(nn.Module):
         self.snconv2d1 = snconv2d(gene_ch, nc, kernel_size=3, stride=1, padding=1)
         self.tanh = nn.Tanh()
 
-    def forward(self, z, labels, return_features):
+        # adapter用于对齐教师特征
+        self.feat_adapters = nn.ModuleDict()
+
+        # 权重初始化
+        self.apply(init_weights)
+
+    def forward(self, z, labels, return_features=False):
         """
         若 return_features=True, 则返回:
           final_out,
-          [feat_s1, feat_s2, feat_s3, feat_s4],  # 学生各层特征
-          [feat_s1_aligned, feat_s2_aligned, feat_s3_aligned, feat_s4_aligned]  # 适配后(对齐教师通道)的特征
+          [feat_s1, feat_s2, feat_s3, feat_s4]
         """
-        feat_list = []
-
         out = self.snlinear0(z)
         out = out.view(-1, self.gene_ch*16, 4, 4)
 
-        out1 = self.block1(out, labels)    # (B, gene_ch*8, 8, 8)
-        out2 = self.block2(out1, labels)   # (B, gene_ch*4, 16, 16)
-        out3 = self.block3(out2, labels)   # (B, gene_ch*2, 32, 32)
-        out3_attn = self.self_attn(out3)   # (B, gene_ch*2, 32, 32)
-        out4 = self.block4(out3_attn, labels)  # (B, gene_ch, 64, 64)
+        out1 = self.block1(out, labels)
+        out2 = self.block2(out1, labels)
+        out3 = self.block3(out2, labels)
+        out3_attn = self.self_attn(out3)
+        out4 = self.block4(out3_attn, labels)
 
         out_bn = self.bn(out4)
         out_relu = self.relu(out_bn)
@@ -278,10 +306,27 @@ class CcGAN_SAGAN_Generator_Student(nn.Module):
         out_final = self.tanh(out_final)
 
         if return_features:
-            feat_list = [out1, out2, out3, out3_attn, out4]  # 返回原始特征
+            feat_list = [out1, out2, out3, out4]
             return out_final, feat_list
         else:
             return out_final
+
+    def match_teacher_feat(self, student_feat, teacher_feat):
+        """
+        使用1x1卷积对学生特征进行通道变换，以匹配教师特征的通道数，同时保持反向传播可学习。
+        """
+        teacher_channels = teacher_feat.size(1)
+        student_channels = student_feat.size(1)
+        key = f"{student_channels}_to_{teacher_channels}"
+
+        if key not in self.feat_adapters:
+            self.feat_adapters[key] = nn.Conv2d(
+                student_channels, teacher_channels, kernel_size=1, stride=1, padding=0
+            ).to(student_feat.device)
+
+        return self.feat_adapters[key](student_feat)
+
+
 
 
 # # SAGAN生成器（条件GAN版本），根据随机噪声和标签生成图像
