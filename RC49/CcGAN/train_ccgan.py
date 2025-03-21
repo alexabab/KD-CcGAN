@@ -1,736 +1,585 @@
-# 导入必要的库
-import torch                                  # PyTorch，深度学习框架
-import numpy as np                            # 用于数值计算的库
-import os                                     # 操作系统接口，用于文件和目录操作
-import timeit                                 # 用于计时，评估代码运行时间
-from PIL import Image                         # 图像处理库，支持打开、操作和保存图像
-from torchvision.utils import save_image      # 用于保存生成的图像
-import torch.cuda as cutorch                  # CUDA相关操作，可直接调用GPU资源
-import torch.nn as nn                         # PyTorch的神经网络模块
-# 导入自定义模块和函数
-from utils import SimpleProgressBar, IMGs_dataset  # 自定义进度条和数据集加载工具
-from opts import parse_opts                        # 自定义参数解析模块，用于获取程序运行参数
-from DiffAugment_pytorch import DiffAugment        # 数据增强模块，用于对图像进行DiffAugment增强
-from torch.nn import functional as F               # PyTorch的函数模块
-''' Settings '''
-# 解析命令行参数或配置文件，获取运行时的参数设置
-args = parse_opts()
+"""
+本代码改编自 https://github.com/voletiv/self-attention-GAN-pytorch/blob/master/sagan_models.py
+实现了带自注意力机制的条件GAN（SAGAN）生成器和判别器，使用谱归一化（spectral normalization）
+对网络进行正则化以提高训练稳定性。
+"""
 
-# 从参数中提取GAN相关的参数设置
-gan_arch = args.GAN_arch                   # GAN的架构类型
-loss_type = args.loss_type_gan             # 损失函数类型（例如 vanilla 或 hinge）
-niters = args.niters_gan                   # 训练总迭代次数
-resume_niters = args.resume_niters_gan     # 恢复训练时的起始迭代次数
-dim_gan = args.dim_gan                     # GAN生成器输入的随机噪声向量的维度
-lr_g = args.lr_g_gan                       # 生成器学习率
-lr_d = args.lr_d_gan                       # 判别器学习率
-save_niters_freq = args.save_niters_freq   # 模型保存的频率（每迭代多少次保存一次）
-batch_size_disc = args.batch_size_disc     # 判别器每个批次处理的样本数
-batch_size_gene = args.batch_size_gene     # 生成器每个批次生成的样本数
-# batch_size_max = max(batch_size_disc, batch_size_gene)  # 可选：计算批次中较大的样本数
-num_D_steps = args.num_D_steps             # 每次迭代中判别器的训练步数
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-visualize_freq = args.visualize_freq       # 可视化生成图像的频率（每迭代多少次保存一次图片）
-
-num_workers = args.num_workers             # 数据加载时的子进程数
-
-threshold_type = args.threshold_type       # 阈值类型（例如 "hard" 或 "soft"）
-nonzero_soft_weight_threshold = args.nonzero_soft_weight_threshold  # 软权重非零的阈值
-
-num_channels = args.num_channels           # 图像的通道数，例如RGB图像为3
-img_size = args.img_size                   # 图像尺寸（边长）
-max_label = args.max_label                 # 标签的最大值
-
-# 是否使用DiffAugment数据增强以及所采用的策略
-use_DiffAugment = args.gan_DiffAugment
-policy = args.gan_DiffAugment_policy
-
-## 梯度累积设置，用于在内存不足的情况下模拟大批量训练
-num_grad_acc_d = args.num_grad_acc_d       # 判别器梯度累积步数
-num_grad_acc_g = args.num_grad_acc_g       # 生成器梯度累积步数
+from torch.nn.utils import spectral_norm
+from torch.nn.init import xavier_uniform_
 
 
-## 定义图像归一化函数
-def normalize_images(batch_images):
-    """
-    将输入图像归一化到[-1,1]的范围。
-    参数:
-        batch_images: 输入的图像数组（假设像素值范围为0-255）
-    返回:
-        归一化后的图像张量
-    """
-    batch_images = batch_images / 255.0             # 先归一化到[0,1]
-    batch_images = (batch_images - 0.5) / 0.5         # 再映射到[-1,1]
-    return batch_images
+# -----------------------------
+# 权重初始化函数：对于线性层和卷积层，采用Xavier均匀初始化，并将偏置初始化为0
+def init_weights(m):
+    if type(m) == nn.Linear or type(m) == nn.Conv2d:
+        xavier_uniform_(m.weight)
+        if m.bias is not None:
+            m.bias.data.fill_(0.)
 
-class RKDLoss(nn.Module):
-    """Relational Knowledge Distillation, 来自 CVPR2019"""
-    def __init__(self, w_d=25, w_a=50):
-        super(RKDLoss, self).__init__()
-        self.w_d = w_d  # distance 项权重
-        self.w_a = w_a  # angle   项权重
 
-    def forward(self, f_s, f_t):
-        # 先把学生和教师特征打平到 (batch_size, num_features)
-        student = f_s.view(f_s.shape[0], -1)
-        teacher = f_t.view(f_t.shape[0], -1)
+# -----------------------------
+# 封装一个带谱归一化的卷积层，调用spectral_norm包装nn.Conv2d
+def snconv2d(in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True):
+    return spectral_norm(nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size,
+                                   stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias))
 
-        # 1. 计算教师网络特征两两之间的 pairwise distance，并做归一化
-        with torch.no_grad():
-            t_d = self.pdist(teacher, squared=False)   # pairwise dist
-            mean_td = t_d[t_d > 0].mean()
-            t_d = t_d / mean_td
 
-        d = self.pdist(student, squared=False)
-        mean_d = d[d > 0].mean()
-        d = d / mean_d
+# 封装一个带谱归一化的全连接层
+def snlinear(in_features, out_features, bias=True):
+    return spectral_norm(nn.Linear(in_features=in_features, out_features=out_features, bias=bias))
 
-        loss_d = F.smooth_l1_loss(d, t_d)
 
-        # 2. 计算教师网络特征之间的两两向量角度
-        with torch.no_grad():
-            td = (teacher.unsqueeze(0) - teacher.unsqueeze(1))
-            norm_td = F.normalize(td, p=2, dim=2)
-            # 两个向量之间的内积可以反映角度的余弦值
-            t_angle = torch.bmm(norm_td, norm_td.transpose(1, 2)).view(-1)
+# -----------------------------
+# 自注意力模块
+class Self_Attn(nn.Module):
+    """自注意力层，用于捕捉长程依赖和全局特征"""
 
-        sd = (student.unsqueeze(0) - student.unsqueeze(1))
-        norm_sd = F.normalize(sd, p=2, dim=2)
-        s_angle = torch.bmm(norm_sd, norm_sd.transpose(1, 2)).view(-1)
+    def __init__(self, in_channels):
+        super(Self_Attn, self).__init__()
+        self.in_channels = in_channels
+        # 通过1x1卷积生成Theta特征，输出通道数为 in_channels // 8
+        self.snconv1x1_theta = snconv2d(in_channels=in_channels, out_channels=in_channels//8, kernel_size=1, stride=1, padding=0)
+        # 通过1x1卷积生成Phi特征
+        self.snconv1x1_phi = snconv2d(in_channels=in_channels, out_channels=in_channels//8, kernel_size=1, stride=1, padding=0)
+        # 通过1x1卷积生成g特征，输出通道数为 in_channels // 2
+        self.snconv1x1_g = snconv2d(in_channels=in_channels, out_channels=in_channels//2, kernel_size=1, stride=1, padding=0)
+        # 通过1x1卷积将自注意力加权后的特征映射回原通道数
+        self.snconv1x1_attn = snconv2d(in_channels=in_channels//2, out_channels=in_channels, kernel_size=1, stride=1, padding=0)
+        # 使用最大池化降低空间分辨率，便于计算注意力矩阵
+        self.maxpool = nn.MaxPool2d(2, stride=2, padding=0)
+        # 在最后一个维度上进行softmax归一化
+        self.softmax  = nn.Softmax(dim=-1)
+        # 可学习的参数sigma，初始值为0，控制自注意力加权特征的影响程度
+        self.sigma = nn.Parameter(torch.zeros(1))
 
-        loss_a = F.smooth_l1_loss(s_angle, t_angle)
-
-        # 最终 RKD 的 loss 同时考虑距离和角度
-        loss = self.w_d * loss_d + self.w_a * loss_a
-        return loss
-
-    @staticmethod
-    def pdist(e, squared=False, eps=1e-12):
+    def forward(self, x):
         """
-        计算向量 e 的两两距离。若 squared=True 则返回平方距离，否则返回欧式距离。
+        输入：
+            x: 输入特征图，形状 (B, C, H, W)
+        输出：
+            out: 与输入x相加后的自注意力增强特征图
         """
-        e_square = e.pow(2).sum(dim=1)
-        prod = e @ e.t()
-        res = (e_square.unsqueeze(1) + e_square.unsqueeze(0) - 2 * prod).clamp(min=eps)
+        _, ch, h, w = x.size()
+        # Theta路径：1x1卷积后reshape为 (B, C//8, H*W)
+        theta = self.snconv1x1_theta(x)
+        theta = theta.view(-1, ch//8, h*w)
+        # Phi路径：1x1卷积后池化，reshape为 (B, C//8, H*W//4)
+        phi = self.snconv1x1_phi(x)
+        phi = self.maxpool(phi)
+        phi = phi.view(-1, ch//8, h*w//4)
+        # 计算注意力矩阵：对Theta和Phi进行矩阵乘法，结果形状为 (B, H*W, H*W//4)
+        attn = torch.bmm(theta.permute(0, 2, 1), phi)
+        attn = self.softmax(attn)
+        # g路径：1x1卷积后池化，reshape为 (B, C//2, H*W//4)
+        g = self.snconv1x1_g(x)
+        g = self.maxpool(g)
+        g = g.view(-1, ch//2, h*w//4)
+        # 对g和注意力矩阵进行矩阵乘法，得到注意力加权特征，reshape回 (B, C//2, H, W)
+        attn_g = torch.bmm(g, attn.permute(0, 2, 1))
+        attn_g = attn_g.view(-1, ch//2, h, w)
+        # 通过1x1卷积将加权特征映射回原始通道数
+        attn_g = self.snconv1x1_attn(attn_g)
+        # 最终输出为输入x与加权特征的和，权重由sigma控制
+        out = x + self.sigma * attn_g
+        return out
 
-        if not squared:
-            res = res.sqrt()
 
-        # 对角线元素(自身距离自己)重置为0
-        res = res.clone()
-        res[range(len(e)), range(len(e))] = 0
-        return res
+"""
+生成器部分
+"""
 
-## 定义CCGAN（条件连续GAN）训练函数
-def train_ccgan_with_kd(kernel_sigma, kappa, train_images, train_labels,netG, netD,
-                        netG_student, KD_rate,net_y2h, save_images_folder,
-                        save_models_folder=None,clip_label=False):
+# 条件批归一化层：根据标签嵌入信息调整归一化结果
+class ConditionalBatchNorm2d(nn.Module):
+    def __init__(self, num_features, dim_embed):
+        """
+        参数：
+            num_features: 输入特征图通道数
+            dim_embed: 标签嵌入维度
+        """
+        super().__init__()
+        self.num_features = num_features
+        # 标准批归一化，但不使用可学习参数（affine=False）
+        self.bn = nn.BatchNorm2d(num_features, momentum=0.001, affine=False)
+        # 两个全连接层分别映射标签嵌入到gamma和beta
+        self.embed_gamma = nn.Linear(dim_embed, num_features, bias=False)
+        self.embed_beta = nn.Linear(dim_embed, num_features, bias=False)
+
+    def forward(self, x, y):
+        """
+        输入：
+            x: 特征图 (B, C, H, W)
+            y: 标签嵌入 (B, dim_embed)
+        输出：
+            条件归一化后的特征图
+        """
+        out = self.bn(x)
+        # 计算缩放因子gamma和偏置beta，并reshape为 (B, C, 1, 1)
+        gamma = self.embed_gamma(y).view(-1, self.num_features, 1, 1)
+        beta = self.embed_beta(y).view(-1, self.num_features, 1, 1)
+        # 采用公式：out = bn(x) + gamma * bn(x) + beta
+        out = out + gamma * out + beta
+        return out
+
+def match_teacher_feat(student_feat, teacher_feat_shape, use_conv=True):
     """
-    训练条件连续GAN的函数
-    参数:
-        kernel_sigma: 高斯核标准差，用于对标签添加噪声
-        kappa: 标签附近的窗口宽度参数，用于选择真实样本
-        train_images: 训练图像数据（未归一化到[-1,1]）
-        train_labels: 与图像对应的标签（连续值）
-        netG: 生成器网络
-        netD: 判别器网络
-        netD_student: 学生判别器网络
-        KD_rate: KD损失的权重
-        net_y2h: 标签到隐向量映射网络，用于将标签转换为隐含特征
-        save_images_folder: 保存生成图像的文件夹路径
-        save_models_folder: 模型保存的文件夹路径（可选）
-        clip_label: 是否对标签进行裁剪（将标签限制在一定范围内）
-    返回:
-        训练后的生成器和判别器
+    将学生网络特征的通道数和空间尺寸对齐教师网络特征。
+
+    参数：
+        student_feat: 学生特征, shape为(B, C_s, H_s, W_s)
+        teacher_feat_shape: 教师特征的shape, (B, C_t, H_t, W_t)
+        use_conv: 是否使用卷积调整通道，若为False则仅插值上采样或下采样空间尺寸
+
+    返回：
+        调整后的学生特征，维度与教师特征一致。
     """
-    # 将网络转移到GPU
-    netG = netG.cuda()
-    netD = netD.cuda()
-    net_y2h = net_y2h.cuda()
-    net_y2h.eval()  # 映射网络在训练过程中不更新参数
-
-    # ---- 教师生成器固定，不更新参数 ----
-    netG.eval()
-    for param in netG.parameters():
-        param.requires_grad = False
-
-    # ---- 学生生成器要训练 ----
-    netG_student = netG_student.cuda()
-    netG_student.train()
-
-    # 优化器：判别器和学生生成器各自一个
-    optimizerD = torch.optim.Adam(netD.parameters(), lr=lr_d, betas=(0.5, 0.999))
-    optimizerG_s = torch.optim.Adam(netG_student.parameters(), lr=lr_g, betas=(0.5, 0.999))
-
-    criterion_mse = nn.MSELoss()
-
-    # 如果提供了模型保存文件夹，并且设置了恢复训练的起始迭代次数，则加载模型和优化器状态
-    if save_models_folder is not None and resume_niters > 0:
-        save_file = save_models_folder + "/ckpts_in_train/ckpt_niter_{}.pth".format(resume_niters)
-        checkpoint = torch.load(save_file)
-        netG.load_state_dict(checkpoint['netG_state_dict'])
-        netD.load_state_dict(checkpoint['netD_state_dict'])
-        #optimizerG_s.load_state_dict(checkpoint['optimizerG_s_state_dict'])
-        optimizerD.load_state_dict(checkpoint['optimizerD_state_dict'])
-        torch.set_rng_state(checkpoint['rng_state'])
-    # end if
-
-    #################
-    # 获取训练集中所有独一无二的标签，并进行排序
-    unique_train_labels = np.sort(np.array(list(set(train_labels))))
-
-    # 为了可视化，选取标签分布中第5百分位到第95百分位之间的标签
-    n_row = 10  # 可视化图像的行数
-    n_col = n_row  # 可视化图像的列数
-    z_fixed = torch.randn(n_row * n_col, dim_gan, dtype=torch.float).cuda()  # 固定的噪声向量，用于生成固定图像便于比较
-    start_label = np.quantile(train_labels, 0.05)  # 计算第5百分位标签
-    end_label = np.quantile(train_labels, 0.95)    # 计算第95百分位标签
-    selected_labels = np.linspace(start_label, end_label, num=n_row)  # 在线性区间内均匀选取标签
-    y_fixed = np.zeros(n_row * n_col)  # 初始化固定标签数组
-    # 对每一行填充相同的标签，方便观察生成器对不同标签的生成效果
-    for i in range(n_row):
-        curr_label = selected_labels[i]
-        for j in range(n_col):
-            y_fixed[i * n_col + j] = curr_label
-    print(y_fixed)
-    y_fixed = torch.from_numpy(y_fixed).type(torch.float).view(-1, 1).cuda()
-
-    start_time = timeit.default_timer()  # 记录训练开始时间
-    # 主训练循环，从resume_niters开始迭代到总迭代次数niters
-    for niter in range(resume_niters, niters):
-
-        ''' 训练判别器 '''
-        # 对于每次迭代，判别器可能需要多次更新
-        for step_D_index in range(num_D_steps):
-
-            optimizerD.zero_grad()  # 清空判别器的梯度
-
-            # 梯度累积，分多步计算梯度再反向传播
-            for accumulation_index in range(num_grad_acc_d):
-
-                ## 随机从训练标签中抽取一批样本的标签（大小为batch_size_disc）
-                batch_target_labels_in_dataset = np.random.choice(unique_train_labels, size=batch_size_disc, replace=True)
-                ## 对抽取的标签添加高斯噪声，用于估计条件图像分布
-                batch_epsilons = np.random.normal(0, kernel_sigma, batch_size_disc)
-                batch_target_labels = batch_target_labels_in_dataset + batch_epsilons
-
-                ## 根据添加噪声后的标签，在训练集里寻找标签接近的真实样本，并同时生成用于伪造图像的标签
-                batch_real_indx = np.zeros(batch_size_disc, dtype=int)  # 存储满足条件的真实图像在数据集中的索引
-                batch_fake_labels = np.zeros(batch_size_disc)             # 用于生成伪造图像的标签
-
-                # 对于每个样本，寻找合适的真实图像索引和对应的伪造标签
-                for j in range(batch_size_disc):
-                    ## 根据阈值类型（硬阈值或软阈值）确定标签的邻域
-                    if threshold_type == "hard":
-                        indx_real_in_vicinity = np.where(np.abs(train_labels - batch_target_labels[j]) <= kappa)[0]
-                    else:
-                        # 对于soft阈值，使用一个反转的权重函数来确定符合条件的样本
-                        indx_real_in_vicinity = np.where((train_labels - batch_target_labels[j])**2 <= -np.log(nonzero_soft_weight_threshold) / kappa)[0]
-
-                    ## 如果当前噪声导致没有找到任何真实样本（例如当标签间隔较大时），则重新生成噪声
-                    while len(indx_real_in_vicinity) < 1:
-                        batch_epsilons_j = np.random.normal(0, kernel_sigma, 1)
-                        batch_target_labels[j] = batch_target_labels_in_dataset[j] + batch_epsilons_j
-                        if clip_label:
-                            batch_target_labels = np.clip(batch_target_labels, 0.0, 1.0)
-                        ## 重新根据阈值类型选择邻域内的真实样本
-                        if threshold_type == "hard":
-                            indx_real_in_vicinity = np.where(np.abs(train_labels - batch_target_labels[j]) <= kappa)[0]
-                        else:
-                            indx_real_in_vicinity = np.where((train_labels - batch_target_labels[j])**2 <= -np.log(nonzero_soft_weight_threshold) / kappa)[0]
-                    # end while
-
-                    # 确保至少找到了一个样本
-                    assert len(indx_real_in_vicinity) >= 1
-
-                    # 从邻域内随机选择一个真实样本的索引
-                    batch_real_indx[j] = np.random.choice(indx_real_in_vicinity, size=1)[0]
-
-                    ## 为伪造图像生成标签，标签取值在(batch_target_labels[j]-kappa, batch_target_labels[j]+kappa)范围内，
-                    ## 若为soft阈值，则使用相应的区间
-                    if threshold_type == "hard":
-                        lb = batch_target_labels[j] - kappa
-                        ub = batch_target_labels[j] + kappa
-                    else:
-                        lb = batch_target_labels[j] - np.sqrt(-np.log(nonzero_soft_weight_threshold) / kappa)
-                        ub = batch_target_labels[j] + np.sqrt(-np.log(nonzero_soft_weight_threshold) / kappa)
-                    lb = max(0.0, lb); ub = min(ub, 1.0)  # 保证标签在[0,1]范围内
-                    assert lb <= ub
-                    assert lb >= 0 and ub >= 0
-                    assert lb <= 1 and ub <= 1
-                    batch_fake_labels[j] = np.random.uniform(lb, ub, size=1)[0]
-                # end for j
-
-                ## 根据上面选定的真实样本索引，从训练集中提取真实图像和对应的标签
-                batch_real_images = torch.from_numpy(normalize_images(train_images[batch_real_indx]))
-                batch_real_images = batch_real_images.type(torch.float).cuda()
-                batch_real_labels = train_labels[batch_real_indx]
-                batch_real_labels = torch.from_numpy(batch_real_labels).type(torch.float).cuda()
-
-                ## 将生成伪造图像时用到的标签转换为张量
-                batch_fake_labels = torch.from_numpy(batch_fake_labels).type(torch.float).cuda()
-                # 生成随机噪声，作为生成器的输入
-                z = torch.randn(batch_size_disc, dim_gan, dtype=torch.float).cuda()
-                # 使用学生生成器生成伪造图像
-                batch_fake_images = netG_student(z, net_y2h(batch_fake_labels), return_features=False)
-
-                ## 将批次目标标签转换为张量，作为判别器的条件输入
-                batch_target_labels = torch.from_numpy(batch_target_labels).type(torch.float).cuda()
-
-                ## 计算权重向量：若使用soft阈值，则对真实和伪造标签计算指数衰减权重，否则均为1
-                if threshold_type == "soft":
-                    real_weights = torch.exp(-kappa * (batch_real_labels - batch_target_labels)**2).cuda()
-                    fake_weights = torch.exp(-kappa * (batch_fake_labels - batch_target_labels)**2).cuda()
-                else:
-                    real_weights = torch.ones(batch_size_disc, dtype=torch.float).cuda()
-                    fake_weights = torch.ones(batch_size_disc, dtype=torch.float).cuda()
-                # end if threshold type
-
-                # forward前向传播判别器
-                if use_DiffAugment:
-                    # 使用DiffAugment对图像进行数据增强后再送入判别器
-                    real_dis_out = netD(DiffAugment(batch_real_images, policy=policy), net_y2h(batch_target_labels))
-                    fake_dis_out = netD(DiffAugment(batch_fake_images.detach(), policy=policy), net_y2h(batch_target_labels))
-                else:
-                    real_dis_out = netD(batch_real_images, net_y2h(batch_target_labels))
-                    fake_dis_out = netD(batch_fake_images.detach(), net_y2h(batch_target_labels))
-
-                # 根据损失类型计算判别器的损失
-                if loss_type == "vanilla":
-                    # vanilla GAN的交叉熵损失
-                    real_dis_out = torch.nn.Sigmoid()(real_dis_out)
-                    fake_dis_out = torch.nn.Sigmoid()(fake_dis_out)
-                    d_loss_real = - torch.log(real_dis_out + 1e-20)
-                    d_loss_fake = - torch.log(1 - fake_dis_out + 1e-20)
-                elif loss_type == "hinge":
-                    # hinge损失
-                    d_loss_real = torch.nn.ReLU()(1.0 - real_dis_out)
-                    d_loss_fake = torch.nn.ReLU()(1.0 + fake_dis_out)
-                else:
-                    raise ValueError('Not supported loss type!!!')
-
-                # 将真实样本损失和伪造样本损失按照权重进行加权平均，并考虑梯度累积步数
-                d_loss = torch.mean(real_weights.view(-1) * d_loss_real.view(-1)) + torch.mean(fake_weights.view(-1) * d_loss_fake.view(-1)) / float(num_grad_acc_d)
-
-                d_loss.backward()  # 反向传播计算梯度
-            # end for accumulation_index
-
-            optimizerD.step()  # 更新判别器参数
-
-        # end for step_D_index
-
-
-
-        ''' 训练生成器 '''
-        netG_student.train()
-        optimizerG_s.zero_grad()
-
-        # 梯度累积，分多步计算生成器的梯度
-        for accumulation_index in range(num_grad_acc_g):
-
-            # 生成伪造图像的标签，类似于判别器的处理
-            ## 随机抽取一批标签，并添加高斯噪声
-            batch_target_labels_in_dataset = np.random.choice(unique_train_labels,
-                                                              size=batch_size_gene,
-                                                              replace=True)
-            batch_epsilons = np.random.normal(0, kernel_sigma, batch_size_gene)
-            batch_target_labels = batch_target_labels_in_dataset + batch_epsilons
-            batch_target_labels = torch.from_numpy(batch_target_labels).type(torch.float).cuda()
-
-            # 生成随机噪声作为输入
-            z = torch.randn(batch_size_gene, dim_gan, dtype=torch.float).cuda()
-            # 1) 用教师网络得到 teacher_out, teacher_feats
-            with torch.no_grad():
-                teacher_out, teacher_feats = netG(z, net_y2h(batch_target_labels),
-                                                  return_features=True)
-
-            # 2) 用学生网络得到 student_out, student_feats
-            # 生成学生输出及特征用于 KD 损失计算
-            student_out, student_feats = netG_student(
-            z, net_y2h(batch_target_labels), return_features=True)
-
-
-            # 3) GAN损失 (看你用 hinge 还是 vanilla)
-            dis_out = netD(student_out, net_y2h(batch_target_labels))
-            if loss_type == "vanilla":
-                dis_out = torch.sigmoid(dis_out)
-                g_loss = -torch.mean(torch.log(dis_out+1e-20))
-            elif loss_type == "hinge":
-                g_loss = -dis_out.mean()
-
-        # 4) 计算RKD损失
-        rkd_loss_total = 0.0
-        layer_weights = [1, 2, 3, 4]  # 各层权重可调整
-
-        # 遍历各层特征 (假设teacher_feats和student_feats层数相同)
-        for layer_idx in range(len(teacher_feats)):
-            # 教师特征:
-            teacher_feats[layer_idx]
-            # 学生特征:
-            student_feats[layer_idx]
-
-            # 展平特征图 (保留batch维度)
-            t_feat = teacher_feats[layer_idx].flatten(start_dim=1)
-            s_feat = student_feats[layer_idx].flatten(start_dim=1)
-
-            # 计算RKD损失并加权
-            rkd_loss_layer = RKDLoss(w_d=25, w_a=50)(s_feat, t_feat)
-            rkd_loss_total += layer_weights[layer_idx] * rkd_loss_layer
-
-        # 5) 合并损失
-        g_loss_total = g_loss + KD_rate * rkd_loss_total
-        g_loss_total = g_loss_total / float(num_grad_acc_g)
-        g_loss_total.backward()
-
-        # 生成伪造图像
-        batch_fake_images = netG_student(z, net_y2h(batch_target_labels), return_features=False)
-        # end for accumulation_index
-
-        optimizerG_s.step()  # 更新生成器参数
-
-        # 每20次迭代打印一次训练状态，包括损失、真实和伪造样本的判别器输出平均值以及消耗时间
-        if (niter + 1) % 20 == 0:
-            print("CcGAN,%s: [Iter %d/%d] [RKD loss: %.4e] [G loss: %.4e] [real prob: %.3f] [fake prob: %.3f] [Time: %.4f]" %
-                  (gan_arch, niter + 1, niters, rkd_loss_total.item(), g_loss.item(),
-                   real_dis_out.mean().item(), fake_dis_out.mean().item(), timeit.default_timer() - start_time))
-
-        # 按设定频率进行生成图像的可视化
-        if (niter + 1) % visualize_freq == 0:
-            netG.eval()  # 设置生成器为评估模式
-            with torch.no_grad():
-                gen_imgs = netG_student(z_fixed, net_y2h(y_fixed),return_features=False)
-                gen_imgs = gen_imgs.detach().cpu()
-                # 保存生成的图像到指定文件夹中，n_row参数用于控制图片拼接的行数
-                save_image(gen_imgs.data, save_images_folder + '/{}.png'.format(niter + 1), nrow=n_row, normalize=True)
-
-        # 根据设定频率保存模型的参数和优化器状态
-        if save_models_folder is not None and ((niter + 1) % save_niters_freq == 0 or (niter + 1) == niters):
-            save_file = save_models_folder + "/ckpts_in_train/ckpt_niter_{}.pth".format(niter + 1)
-            os.makedirs(os.path.dirname(save_file), exist_ok=True)
-            torch.save({
-                'netG_state_dict': netG.state_dict(),
-                'netD_state_dict': netD.state_dict(),
-                'optimizerG_state_dict': optimizerG_s.state_dict(),
-                'optimizerD_state_dict': optimizerD.state_dict(),
-                'rng_state': torch.get_rng_state()
-            }, save_file)
-    # end for niter
-    return netG_student
-
-## 定义根据给定标签采样伪造图像的函数
-def sample_ccgan_given_labels(netG, net_y2h, labels, batch_size=500, to_numpy=True, denorm=True, verbose=True):
-    """
-    使用预训练生成器根据给定的标签采样生成图像
-    参数:
-        netG: 预训练生成器网络
-        net_y2h: 标签到隐向量映射网络
-        labels: 目标标签数组（浮点数，归一化后的标签）
-        batch_size: 每个批次生成图像的数量,默认500
-        to_numpy: 是否将生成的图像转换为numpy数组
-        denorm: 是否对生成的图像进行反归一化操作（将[-1,1]范围转换回[0,255]），用于节省内存
-        verbose: 是否显示进度条
-    返回:
-        fake_images: 生成的图像数组
-        fake_labels: 对应的标签数组
-    """
-    nfake = len(labels)  # 需要生成的图像总数
-    if batch_size > nfake:
-        batch_size = nfake
-
-    fake_images = []
-    # 为方便批次生成，将labels扩充，防止最后一个批次不足batch_size
-    fake_labels = np.concatenate((labels, labels[0:batch_size]))
-    netG = netG.cuda()
-    netG.eval()  # 设置生成器为评估模式
-    net_y2h = net_y2h.cuda()
-    net_y2h.eval()
-    with torch.no_grad():
-        if verbose:
-            pb = SimpleProgressBar()  # 初始化自定义进度条
-        n_img_got = 0
-        while n_img_got < nfake:
-            # 每次生成一批随机噪声作为输入
-            z = torch.randn(batch_size, dim_gan, dtype=torch.float).cuda()
-            # 从fake_labels中取出当前批次对应的标签，并转换为张量
-            y = torch.from_numpy(fake_labels[n_img_got:(n_img_got + batch_size)]).type(torch.float).view(-1, 1).cuda()
-            # 生成图像
-            batch_fake_images = netG(z, net_y2h(y),return_features=False)
-            if denorm:  # 如果需要反归一化，转换生成图像到[0,255]
-                # 断言生成的图像值在[-1,1]范围内
-                assert batch_fake_images.max().item() <= 1.0 and batch_fake_images.min().item() >= -1.0
-                batch_fake_images = batch_fake_images * 0.5 + 0.5  # 映射到[0,1]
-                batch_fake_images = batch_fake_images * 255.0      # 映射到[0,255]
-                batch_fake_images = batch_fake_images.type(torch.uint8)
-                # 可选：可以添加断言检查转换后的图像是否正确
-            fake_images.append(batch_fake_images.cpu())
-            n_img_got += batch_size
-            if verbose:
-                pb.update(min(float(n_img_got) / nfake, 1) * 100)
-        # end while
-
-    # 将所有批次拼接在一起
-    fake_images = torch.cat(fake_images, dim=0)
-    # 去除多余生成的样本，使生成图像数量精确等于nfake
-    fake_images = fake_images[0:nfake]
-    fake_labels = fake_labels[0:nfake]
-
-    if to_numpy:
-        fake_images = fake_images.numpy()  # 转换为numpy数组便于后续处理
-    else:
-        fake_labels = torch.from_numpy(fake_labels).type(torch.float)
-
-    return fake_images, fake_labels
-
-def train_ccgan(kernel_sigma, kappa, train_images, train_labels, netG, netD, net_y2h, save_images_folder, save_models_folder=None, clip_label=False):
-    """
-    训练条件连续GAN的函数
-    参数:
-        kernel_sigma: 高斯核标准差，用于对标签添加噪声
-        kappa: 标签附近的窗口宽度参数，用于选择真实样本
-        train_images: 训练图像数据（未归一化到[-1,1]）
-        train_labels: 与图像对应的标签（连续值）
-        netG: 生成器网络
-        netD: 判别器网络
-        net_y2h: 标签到隐向量映射网络，用于将标签转换为隐含特征
-        save_images_folder: 保存生成图像的文件夹路径
-        save_models_folder: 模型保存的文件夹路径（可选）
-        clip_label: 是否对标签进行裁剪（将标签限制在一定范围内）
-    返回:
-        训练后的生成器和判别器
-    """
-    # 将网络转移到GPU
-    netG = netG.cuda()
-    netD = netD.cuda()
-    net_y2h = net_y2h.cuda()
-    net_y2h.eval()  # 映射网络在训练过程中不更新参数
-
-    # 定义生成器和判别器的优化器（Adam优化器）
-    optimizerG = torch.optim.Adam(netG.parameters(), lr=lr_g, betas=(0.5, 0.999))
-    optimizerD = torch.optim.Adam(netD.parameters(), lr=lr_d, betas=(0.5, 0.999))
-
-    # 如果提供了模型保存文件夹，并且设置了恢复训练的起始迭代次数，则加载模型和优化器状态
-    if save_models_folder is not None and resume_niters > 0:
-        save_file = save_models_folder + "/ckpts_in_train/ckpt_niter_{}.pth".format(resume_niters)
-        checkpoint = torch.load(save_file)
-        netG.load_state_dict(checkpoint['netG_state_dict'])
-        netD.load_state_dict(checkpoint['netD_state_dict'])
-        optimizerG.load_state_dict(checkpoint['optimizerG_state_dict'])
-        optimizerD.load_state_dict(checkpoint['optimizerD_state_dict'])
-        torch.set_rng_state(checkpoint['rng_state'])
-    # end if
-
-    #################
-    # 获取训练集中所有独一无二的标签，并进行排序
-    unique_train_labels = np.sort(np.array(list(set(train_labels))))
-
-    # 为了可视化，选取标签分布中第5百分位到第95百分位之间的标签
-    n_row = 10  # 可视化图像的行数
-    n_col = n_row  # 可视化图像的列数
-    z_fixed = torch.randn(n_row * n_col, dim_gan, dtype=torch.float).cuda()  # 固定的噪声向量，用于生成固定图像便于比较
-    start_label = np.quantile(train_labels, 0.05)  # 计算第5百分位标签
-    end_label = np.quantile(train_labels, 0.95)    # 计算第95百分位标签
-    selected_labels = np.linspace(start_label, end_label, num=n_row)  # 在线性区间内均匀选取标签
-    y_fixed = np.zeros(n_row * n_col)  # 初始化固定标签数组
-    # 对每一行填充相同的标签，方便观察生成器对不同标签的生成效果
-    for i in range(n_row):
-        curr_label = selected_labels[i]
-        for j in range(n_col):
-            y_fixed[i * n_col + j] = curr_label
-    print(y_fixed)
-    y_fixed = torch.from_numpy(y_fixed).type(torch.float).view(-1, 1).cuda()
-
-    start_time = timeit.default_timer()  # 记录训练开始时间
-    # 主训练循环，从resume_niters开始迭代到总迭代次数niters
-    for niter in range(resume_niters, niters):
-
-        ''' 训练判别器 '''
-        # 对于每次迭代，判别器可能需要多次更新
-        for step_D_index in range(num_D_steps):
-
-            optimizerD.zero_grad()  # 清空判别器的梯度
-
-            # 梯度累积，分多步计算梯度再反向传播
-            for accumulation_index in range(num_grad_acc_d):
-
-                ## 随机从训练标签中抽取一批样本的标签（大小为batch_size_disc）
-                batch_target_labels_in_dataset = np.random.choice(unique_train_labels, size=batch_size_disc, replace=True)
-                ## 对抽取的标签添加高斯噪声，用于估计条件图像分布
-                batch_epsilons = np.random.normal(0, kernel_sigma, batch_size_disc)
-                batch_target_labels = batch_target_labels_in_dataset + batch_epsilons
-
-
-                ## 根据添加噪声后的标签，在训练集里寻找标签接近的真实样本，并同时生成用于伪造图像的标签
-                batch_real_indx = np.zeros(batch_size_disc, dtype=int)  # 存储满足条件的真实图像在数据集中的索引
-                batch_fake_labels = np.zeros(batch_size_disc)             # 用于生成伪造图像的标签
-
-                # 对于每个样本，寻找合适的真实图像索引和对应的伪造标签
-                for j in range(batch_size_disc):
-                    ## 根据阈值类型（硬阈值或软阈值）确定标签的邻域
-                    if threshold_type == "hard":
-                        indx_real_in_vicinity = np.where(np.abs(train_labels - batch_target_labels[j]) <= kappa)[0]
-                    else:
-                        # 对于soft阈值，使用一个反转的权重函数来确定符合条件的样本
-                        indx_real_in_vicinity = np.where((train_labels - batch_target_labels[j])**2 <= -np.log(nonzero_soft_weight_threshold) / kappa)[0]
-
-                    ## 如果当前噪声导致没有找到任何真实样本（例如当标签间隔较大时），则重新生成噪声
-                    while len(indx_real_in_vicinity) < 1:
-                        batch_epsilons_j = np.random.normal(0, kernel_sigma, 1)
-                        batch_target_labels[j] = batch_target_labels_in_dataset[j] + batch_epsilons_j
-                        if clip_label:
-                            batch_target_labels = np.clip(batch_target_labels, 0.0, 1.0)
-                        ## 重新根据阈值类型选择邻域内的真实样本
-                        if threshold_type == "hard":
-                            indx_real_in_vicinity = np.where(np.abs(train_labels - batch_target_labels[j]) <= kappa)[0]
-                        else:
-                            indx_real_in_vicinity = np.where((train_labels - batch_target_labels[j])**2 <= -np.log(nonzero_soft_weight_threshold) / kappa)[0]
-                    # end while
-
-                    # 确保至少找到了一个样本
-                    assert len(indx_real_in_vicinity) >= 1
-
-                    # 从邻域内随机选择一个真实样本的索引
-                    batch_real_indx[j] = np.random.choice(indx_real_in_vicinity, size=1)[0]
-
-                    ## 为伪造图像生成标签，标签取值在(batch_target_labels[j]-kappa, batch_target_labels[j]+kappa)范围内，
-                    ## 若为soft阈值，则使用相应的区间
-                    if threshold_type == "hard":
-                        lb = batch_target_labels[j] - kappa
-                        ub = batch_target_labels[j] + kappa
-                    else:
-                        lb = batch_target_labels[j] - np.sqrt(-np.log(nonzero_soft_weight_threshold) / kappa)
-                        ub = batch_target_labels[j] + np.sqrt(-np.log(nonzero_soft_weight_threshold) / kappa)
-                    lb = max(0.0, lb); ub = min(ub, 1.0)  # 保证标签在[0,1]范围内
-                    assert lb <= ub
-                    assert lb >= 0 and ub >= 0
-                    assert lb <= 1 and ub <= 1
-                    batch_fake_labels[j] = np.random.uniform(lb, ub, size=1)[0]
-                # end for j
-
-                ## 根据上面选定的真实样本索引，从训练集中提取真实图像和对应的标签
-                batch_real_images = torch.from_numpy(normalize_images(train_images[batch_real_indx]))
-                batch_real_images = batch_real_images.type(torch.float).cuda()
-                batch_real_labels = train_labels[batch_real_indx]
-                batch_real_labels = torch.from_numpy(batch_real_labels).type(torch.float).cuda()
-
-                ## 将生成伪造图像时用到的标签转换为张量
-                batch_fake_labels = torch.from_numpy(batch_fake_labels).type(torch.float).cuda()
-                # 生成随机噪声，作为生成器的输入
-                z = torch.randn(batch_size_disc, dim_gan, dtype=torch.float).cuda()
-                # 使用生成器生成伪造图像，条件是通过net_y2h对标签进行映射后的结果
-                batch_fake_images = netG(z, net_y2h(batch_fake_labels))
-
-                ## 将批次目标标签转换为张量，作为判别器的条件输入
-                batch_target_labels = torch.from_numpy(batch_target_labels).type(torch.float).cuda()
-
-                ## 计算权重向量：若使用soft阈值，则对真实和伪造标签计算指数衰减权重，否则均为1
-                if threshold_type == "soft":
-                    real_weights = torch.exp(-kappa * (batch_real_labels - batch_target_labels)**2).cuda()
-                    fake_weights = torch.exp(-kappa * (batch_fake_labels - batch_target_labels)**2).cuda()
-                else:
-                    real_weights = torch.ones(batch_size_disc, dtype=torch.float).cuda()
-                    fake_weights = torch.ones(batch_size_disc, dtype=torch.float).cuda()
-                # end if threshold type
-
-                # forward前向传播判别器
-                if use_DiffAugment:
-                    # 使用DiffAugment对图像进行数据增强后再送入判别器
-                    real_dis_out = netD(DiffAugment(batch_real_images, policy=policy), net_y2h(batch_target_labels))
-                    fake_dis_out = netD(DiffAugment(batch_fake_images.detach(), policy=policy), net_y2h(batch_target_labels))
-                else:
-                    real_dis_out = netD(batch_real_images, net_y2h(batch_target_labels))
-                    fake_dis_out = netD(batch_fake_images.detach(), net_y2h(batch_target_labels))
-
-                # 根据损失类型计算判别器的损失
-                if loss_type == "vanilla":
-                    # vanilla GAN的交叉熵损失
-                    real_dis_out = torch.nn.Sigmoid()(real_dis_out)
-                    fake_dis_out = torch.nn.Sigmoid()(fake_dis_out)
-                    d_loss_real = - torch.log(real_dis_out + 1e-20)
-                    d_loss_fake = - torch.log(1 - fake_dis_out + 1e-20)
-                elif loss_type == "hinge":
-                    # hinge损失
-                    d_loss_real = torch.nn.ReLU()(1.0 - real_dis_out)
-                    d_loss_fake = torch.nn.ReLU()(1.0 + fake_dis_out)
-                else:
-                    raise ValueError('Not supported loss type!!!')
-
-                # 将真实样本损失和伪造样本损失按照权重进行加权平均，并考虑梯度累积步数
-                d_loss = torch.mean(real_weights.view(-1) * d_loss_real.view(-1)) + torch.mean(fake_weights.view(-1) * d_loss_fake.view(-1)) / float(num_grad_acc_d)
-
-                d_loss.backward()  # 反向传播计算梯度
-            # end for accumulation_index
-
-            optimizerD.step()  # 更新判别器参数
-
-        # end for step_D_index
-
-
-
-        ''' 训练生成器 '''
-        netG.train()
-
-        optimizerG.zero_grad()  # 清空生成器梯度
-
-        # 梯度累积，分多步计算生成器的梯度
-        for accumulation_index in range(num_grad_acc_g):
-
-            # 生成伪造图像的标签，类似于判别器的处理
-            ## 随机抽取一批标签，并添加高斯噪声
-            batch_target_labels_in_dataset = np.random.choice(unique_train_labels, size=batch_size_gene, replace=True)
-            batch_epsilons = np.random.normal(0, kernel_sigma, batch_size_gene)
-            batch_target_labels = batch_target_labels_in_dataset + batch_epsilons
-            batch_target_labels = torch.from_numpy(batch_target_labels).type(torch.float).cuda()
-
-            # 生成随机噪声作为输入
-            z = torch.randn(batch_size_gene, dim_gan, dtype=torch.float).cuda()
-            # 生成伪造图像
-            batch_fake_images = netG(z, net_y2h(batch_target_labels))
-
-            # 计算生成器的损失：判别器的输出作为依据
-            if use_DiffAugment:
-                dis_out = netD(DiffAugment(batch_fake_images, policy=policy), net_y2h(batch_target_labels))
-            else:
-                dis_out = netD(batch_fake_images, net_y2h(batch_target_labels))
-            if loss_type == "vanilla":
-                dis_out = torch.nn.Sigmoid()(dis_out)
-                g_loss = - torch.mean(torch.log(dis_out + 1e-20))
-            elif loss_type == "hinge":
-                g_loss = - dis_out.mean()
-
-            g_loss = g_loss / float(num_grad_acc_g)
-
-            # 反向传播计算生成器梯度
-            g_loss.backward()
-
-        # end for accumulation_index
-
-        optimizerG.step()  # 更新生成器参数
-
-        # 每20次迭代打印一次训练状态，包括损失、真实和伪造样本的判别器输出平均值以及消耗时间
-        if (niter + 1) % 20 == 0:
-            print("CcGAN,%s: [Iter %d/%d] [D loss: %.4e] [G loss: %.4e] [real prob: %.3f] [fake prob: %.3f] [Time: %.4f]" %
-                  (gan_arch, niter + 1, niters, d_loss.item(), g_loss.item(),
-                   real_dis_out.mean().item(), fake_dis_out.mean().item(), timeit.default_timer() - start_time))
-
-        # 按设定频率进行生成图像的可视化
-        if (niter + 1) % visualize_freq == 0:
-            netG.eval()  # 设置生成器为评估模式
-            with torch.no_grad():
-                gen_imgs = netG(z_fixed, net_y2h(y_fixed))
-                gen_imgs = gen_imgs.detach().cpu()
-                # 保存生成的图像到指定文件夹中，n_row参数用于控制图片拼接的行数
-                save_image(gen_imgs.data, save_images_folder + '/{}.png'.format(niter + 1), nrow=n_row, normalize=True)
-
-        # 根据设定频率保存模型的参数和优化器状态
-        if save_models_folder is not None and ((niter + 1) % save_niters_freq == 0 or (niter + 1) == niters):
-            save_file = save_models_folder + "/ckpts_in_train/ckpt_niter_{}.pth".format(niter + 1)
-            os.makedirs(os.path.dirname(save_file), exist_ok=True)
-            torch.save({
-                'netG_state_dict': netG.state_dict(),
-                'netD_state_dict': netD.state_dict(),
-                'optimizerG_state_dict': optimizerG.state_dict(),
-                'optimizerD_state_dict': optimizerD.state_dict(),
-                'rng_state': torch.get_rng_state()
-            }, save_file)
-    # end for niter
-    return netG, netD
+    B, C_t, H_t, W_t = teacher_feat_shape
+    _, C_s, H_s, W_s = student_feat.shape
+
+    # 空间尺寸对齐（插值）
+    if (H_s != H_t) or (W_s != W_t):
+        student_feat = F.interpolate(student_feat, size=(H_t, W_t), mode='bilinear', align_corners=True)
+
+    # 通道数对齐（卷积）
+    if use_conv and (C_s != C_t):
+        conv_layer = nn.Conv2d(C_s, C_t, kernel_size=1, stride=1, padding=0).to(student_feat.device)
+        student_feat = conv_layer(student_feat)
+
+    return student_feat
+
+# 生成器残差块（GenBlock），包含条件批归一化、ReLU激活、卷积和上采样
+class GenBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, dim_embed):
+        super(GenBlock, self).__init__()
+        self.cond_bn1 = ConditionalBatchNorm2d(in_channels, dim_embed)
+        self.relu = nn.ReLU(inplace=True)
+        self.snconv2d1 = snconv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.cond_bn2 = ConditionalBatchNorm2d(out_channels, dim_embed)
+        self.snconv2d2 = snconv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.snconv2d0 = snconv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x, labels):
+        """
+        前向传播：
+            x: 输入特征图 (B, in_channels, H, W)
+            labels: 标签嵌入 (B, dim_embed)
+        输出：
+            输出特征图 (B, out_channels, 2H, 2W) —— 经过上采样后尺寸加倍
+        """
+        x0 = x  # 旁路分支保存原始输入
+
+        # 主分支：先条件归一化，再ReLU激活，然后上采样
+        x = self.cond_bn1(x, labels)
+        x = self.relu(x)
+        x = F.interpolate(x, scale_factor=2, mode='nearest')  # 上采样（nearest插值）
+        x = self.snconv2d1(x)  # 进行卷积
+        x = self.cond_bn2(x, labels)
+        x = self.relu(x)
+        x = self.snconv2d2(x)  # 第二次卷积
+
+        # 旁路分支：对原始输入进行上采样和1x1卷积
+        x0 = F.interpolate(x0, scale_factor=2, mode='nearest')
+        x0 = self.snconv2d0(x0)
+
+        # 将主分支和旁路分支相加得到最终输出
+        out = x + x0
+        return out
+
+class CcGAN_SAGAN_Generator(nn.Module):
+    """生成器，根据随机噪声和标签生成图像 (教师模型)"""
+
+    def __init__(self, dim_z, dim_embed=128, nc=3, gene_ch=64):
+        super(CcGAN_SAGAN_Generator, self).__init__()
+        self.dim_z = dim_z
+        self.gene_ch = gene_ch
+        # 全连接，把 z -> (gene_ch*16)*4*4
+        self.snlinear0 = snlinear(in_features=dim_z, out_features=gene_ch*16*4*4)
+
+        # 依次4个生成块 + 自注意力
+        self.block1 = GenBlock(gene_ch*16, gene_ch*8, dim_embed)
+        self.block2 = GenBlock(gene_ch*8, gene_ch*4, dim_embed)
+        self.block3 = GenBlock(gene_ch*4, gene_ch*2, dim_embed)
+        self.self_attn = Self_Attn(gene_ch*2)
+        self.block4 = GenBlock(gene_ch*2, gene_ch, dim_embed)
+
+        # 最后的 BN + ReLU + conv
+        self.bn = nn.BatchNorm2d(gene_ch, eps=1e-5, momentum=0.0001, affine=True)
+        self.relu = nn.ReLU(inplace=True)
+        self.snconv2d1 = snconv2d(in_channels=gene_ch, out_channels=nc, kernel_size=3, stride=1, padding=1)
+        self.tanh = nn.Tanh()
+
+        # 权重初始化
+        self.apply(init_weights)
+
+    def forward(self, z, labels, return_features):
+        """
+        参数:
+            z: (B, dim_z)
+            labels: (B, dim_embed)
+            return_features: 如果为 True, 返回 [block1_out, block2_out, block3_out, block4_out] 等中间特征
+        """
+        # 特征收集列表
+        feat_list = []
+
+        out = self.snlinear0(z)  # (B, gene_ch*16*4*4)
+        out = out.view(-1, self.gene_ch*16, 4, 4)
+
+        out = self.block1(out, labels)   # -> (B, gene_ch*8, 8, 8)
+        if return_features:
+            feat_list.append(out)
+
+        out = self.block2(out, labels)   # -> (B, gene_ch*4, 16, 16)
+        if return_features:
+            feat_list.append(out)
+
+        out = self.block3(out, labels)   # -> (B, gene_ch*2, 32, 32)
+        if return_features:
+            feat_list.append(out)
+
+        out = self.self_attn(out)        # 仍是 (B, gene_ch*2, 32, 32)
+        out = self.block4(out, labels)   # -> (B, gene_ch, 64, 64)
+        if return_features:
+            feat_list.append(out)
+
+        out = self.bn(out)
+        out = self.relu(out)
+        out = self.snconv2d1(out)
+        out = self.tanh(out)             # -> (B, nc, 64, 64)
+
+        if return_features:
+            return out, feat_list
+        else:
+            return out
+
+
+class CcGAN_SAGAN_Generator_Student(nn.Module):
+    """学生生成器，通道减半；同时在 forward 中返回若干层特征，并用 1x1 conv 做通道对齐"""
+
+    def __init__(self, dim_z=256, dim_embed=128, nc=3, gene_ch=32):
+        super(CcGAN_SAGAN_Generator_Student, self).__init__()
+        self.dim_z = dim_z
+        self.gene_ch = gene_ch
+
+        # 线性层把 z -> (gene_ch*16)*4*4
+        self.snlinear0 = snlinear(dim_z, gene_ch*16*4*4)
+
+        # 4个生成块
+        self.block1 = GenBlock(gene_ch*16, gene_ch*8, dim_embed)
+        self.block2 = GenBlock(gene_ch*8, gene_ch*4, dim_embed)
+        self.block3 = GenBlock(gene_ch*4, gene_ch*2, dim_embed)
+        self.self_attn = Self_Attn(gene_ch*2)
+        self.block4 = GenBlock(gene_ch*2, gene_ch, dim_embed)
+
+        self.bn = nn.BatchNorm2d(gene_ch, eps=1e-5, momentum=0.0001, affine=True)
+        self.relu = nn.ReLU(inplace=True)
+        self.snconv2d1 = snconv2d(gene_ch, nc, kernel_size=3, stride=1, padding=1)
+        self.tanh = nn.Tanh()
+
+        # adapter用于对齐教师特征
+        self.feat_adapters = nn.ModuleDict()
+
+        # 权重初始化
+        self.apply(init_weights)
+
+    def forward(self, z, labels, return_features=False):
+        """
+        若 return_features=True, 则返回:
+          final_out,
+          [feat_s1, feat_s2, feat_s3, feat_s4]
+        """
+        out = self.snlinear0(z)
+        out = out.view(-1, self.gene_ch*16, 4, 4)
+
+        out1 = self.block1(out, labels)
+        out2 = self.block2(out1, labels)
+        out3 = self.block3(out2, labels)
+        out3_attn = self.self_attn(out3)
+        out4 = self.block4(out3_attn, labels)
+
+        out_bn = self.bn(out4)
+        out_relu = self.relu(out_bn)
+        out_final = self.snconv2d1(out_relu)
+        out_final = self.tanh(out_final)
+
+        if return_features:
+            feat_list = [out1, out2, out3, out4]
+            return out_final, feat_list
+        else:
+            return out_final
+
+    def match_teacher_feat(self, student_feat, teacher_feat):
+        """
+        使用1x1卷积对学生特征进行通道变换，以匹配教师特征的通道数，同时保持反向传播可学习。
+        """
+        teacher_channels = teacher_feat.size(1)
+        student_channels = student_feat.size(1)
+        key = f"{student_channels}_to_{teacher_channels}"
+
+        if key not in self.feat_adapters:
+            self.feat_adapters[key] = nn.Conv2d(
+                student_channels, teacher_channels, kernel_size=1, stride=1, padding=0
+            ).to(student_feat.device)
+
+        return self.feat_adapters[key](student_feat)
+
+
+
+
+# # SAGAN生成器（条件GAN版本），根据随机噪声和标签生成图像
+# class CcGAN_SAGAN_Generator(nn.Module):
+#     """生成器，根据随机噪声和标签生成图像"""
+
+#     def __init__(self, dim_z, dim_embed=128, nc=3, gene_ch=32):
+#         """
+#         参数：
+#             dim_z: 噪声向量的维度
+#             dim_embed: 标签嵌入的维度
+#             nc: 输出图像通道数（例如3表示RGB）
+#             gene_ch: 生成器基础通道数
+#         """
+#         super(CcGAN_SAGAN_Generator, self).__init__()
+#         self.dim_z = dim_z
+#         self.gene_ch = gene_ch
+
+#         # 将噪声向量通过全连接层映射为初始特征图，尺寸为 (gene_ch*16) x 4 x 4
+#         self.snlinear0 = snlinear(in_features=dim_z, out_features=gene_ch*16*4*4)
+#         # 依次经过4个生成器块，每个块完成上采样和特征变换
+#         self.block1 = GenBlock(gene_ch*16, gene_ch*8, dim_embed)
+#         self.block2 = GenBlock(gene_ch*8, gene_ch*4, dim_embed)
+#         self.block3 = GenBlock(gene_ch*4, gene_ch*2, dim_embed)
+#         # 在特征图较大时加入自注意力模块以捕捉长程依赖
+#         self.self_attn = Self_Attn(gene_ch*2)
+#         self.block4 = GenBlock(gene_ch*2, gene_ch, dim_embed)
+#         # 最后批归一化和ReLU激活
+#         self.bn = nn.BatchNorm2d(gene_ch, eps=1e-5, momentum=0.0001, affine=True)
+#         self.relu = nn.ReLU(inplace=True)
+#         # 最终卷积层，将特征图转换为目标通道数nc，采用3x3卷积
+#         self.snconv2d1 = snconv2d(in_channels=gene_ch, out_channels=nc, kernel_size=3, stride=1, padding=1)
+#         # Tanh激活函数将像素值映射到[-1, 1]
+#         self.tanh = nn.Tanh()
+
+#         # 对所有子模块进行权重初始化
+#         self.apply(init_weights)
+
+#     def forward(self, z, labels):
+#         """
+#         输入：
+#             z: 随机噪声向量 (B, dim_z)
+#             labels: 标签嵌入 (B, dim_embed)
+#         输出：
+#             生成的图像 (B, nc, H, W)
+#         """
+#         # 先将噪声通过全连接层转换为初始特征图，并reshape为 (B, gene_ch*16, 4, 4)
+#         out = self.snlinear0(z)
+#         out = out.view(-1, self.gene_ch*16, 4, 4)
+#         # 依次经过各个生成块进行上采样和特征转换
+#         out = self.block1(out, labels)    # 从4x4上采样到8x8
+#         out = self.block2(out, labels)    # 8x8 -> 16x16
+#         out = self.block3(out, labels)    # 16x16 -> 32x32
+#         out = self.self_attn(out)         # 自注意力模块（保持32x32）
+#         out = self.block4(out, labels)    # 32x32 -> 64x64
+#         out = self.bn(out)
+#         out = self.relu(out)
+#         out = self.snconv2d1(out)           # 最终卷积转换到目标通道数
+#         out = self.tanh(out)                # 归一化到[-1, 1]
+#         return out
+
+
+"""
+判别器部分
+"""
+
+# 判别器优化块，用于第一层处理，包含卷积、ReLU、下采样及旁路连接
+class DiscOptBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        """
+        参数：
+            in_channels: 输入图像通道数
+            out_channels: 输出通道数
+        """
+        super(DiscOptBlock, self).__init__()
+        self.snconv2d1 = snconv2d(in_channels=in_channels, out_channels=out_channels,
+                                  kernel_size=3, stride=1, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.snconv2d2 = snconv2d(in_channels=out_channels, out_channels=out_channels,
+                                  kernel_size=3, stride=1, padding=1)
+        self.downsample = nn.AvgPool2d(2)  # 平均池化下采样
+        # 1x1卷积用于旁路分支，匹配通道数
+        self.snconv2d0 = snconv2d(in_channels=in_channels, out_channels=out_channels,
+                                  kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        """
+        输入：
+            x: 输入特征图 (B, in_channels, H, W)
+        输出：
+            输出特征图 (B, out_channels, H/2, W/2)
+        """
+        x0 = x  # 旁路分支保存原始输入
+
+        x = self.snconv2d1(x)
+        x = self.relu(x)
+        x = self.snconv2d2(x)
+        x = self.downsample(x)  # 主分支进行下采样
+
+        x0 = self.downsample(x0)
+        x0 = self.snconv2d0(x0)  # 旁路分支进行1x1卷积
+
+        out = x + x0  # 两个分支相加
+        return out
+
+
+# 判别器块，可选下采样，且当输入输出通道不匹配时使用1x1卷积调整
+class DiscBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(DiscBlock, self).__init__()
+        self.relu = nn.ReLU(inplace=True)
+        self.snconv2d1 = snconv2d(in_channels=in_channels, out_channels=out_channels,
+                                  kernel_size=3, stride=1, padding=1)
+        self.snconv2d2 = snconv2d(in_channels=out_channels, out_channels=out_channels,
+                                  kernel_size=3, stride=1, padding=1)
+        self.downsample = nn.AvgPool2d(2)
+        # 标记输入与输出通道是否不匹配
+        self.ch_mismatch = False
+        if in_channels != out_channels:
+            self.ch_mismatch = True
+        # 1x1卷积用于调整通道数
+        self.snconv2d0 = snconv2d(in_channels=in_channels, out_channels=out_channels,
+                                  kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x, downsample=True):
+        """
+        输入：
+            x: 输入特征图 (B, in_channels, H, W)
+            downsample: 是否执行下采样操作（默认为True）
+        输出：
+            融合后的特征图 (B, out_channels, H/2, W/2)（若下采样）
+        """
+        x0 = x  # 旁路分支
+
+        x = self.relu(x)
+        x = self.snconv2d1(x)
+        x = self.relu(x)
+        x = self.snconv2d2(x)
+        if downsample:
+            x = self.downsample(x)
+
+        if downsample or self.ch_mismatch:
+            x0 = self.snconv2d0(x0)
+            if downsample:
+                x0 = self.downsample(x0)
+
+        out = x + x0
+        return out
+
+
+# SAGAN判别器（条件GAN版本），利用投影方法将标签信息融入判别
+class CcGAN_SAGAN_Discriminator(nn.Module):
+    """判别器，通过条件投影融合标签嵌入，实现条件判别"""
+
+    def __init__(self, dim_embed=128, nc=3, disc_ch=64):
+        """
+        参数：
+            dim_embed: 标签嵌入维度
+            nc: 输入图像通道数
+            disc_ch: 判别器基础通道数
+        """
+        super(CcGAN_SAGAN_Discriminator, self).__init__()
+        self.disc_ch = disc_ch
+        # 第一个优化块，直接处理原始图像
+        self.opt_block1 = DiscOptBlock(nc, disc_ch)
+        # 自注意力模块，在较低分辨率下捕捉全局信息
+        self.self_attn = Self_Attn(disc_ch)
+        # 后续判别器块，逐步增加通道数并下采样
+        self.block1 = DiscBlock(disc_ch, disc_ch*2)
+        self.block2 = DiscBlock(disc_ch*2, disc_ch*4)
+        self.block3 = DiscBlock(disc_ch*4, disc_ch*8)
+        self.block4 = DiscBlock(disc_ch*8, disc_ch*16)
+        self.relu = nn.ReLU(inplace=True)
+        # 线性层将卷积特征展平后映射为标量输出
+        self.snlinear1 = snlinear(in_features=disc_ch*16*4*4, out_features=1)
+        # 条件投影层：将标签嵌入映射到与展平特征相同的维度
+        self.sn_embedding1 = snlinear(dim_embed, disc_ch*16*4*4, bias=False)
+
+        # 对所有模块进行权重初始化
+        self.apply(init_weights)
+        xavier_uniform_(self.sn_embedding1.weight)
+
+    def forward(self, x, labels):
+        """
+        输入：
+            x: 输入图像 (B, nc, H, W)
+            labels: 标签嵌入 (B, dim_embed)
+        输出：
+            判别器输出分数 (B, 1)
+        """
+        # 通过第一个优化块，下采样并提取特征，输出尺寸例如32x32（假设输入64x64）
+        out = self.opt_block1(x)
+        # 自注意力模块，保持尺寸不变
+        out = self.self_attn(out)
+        out = self.block1(out)    # 例如下采样到16x16
+        out = self.block2(out)    # 16x16 -> 8x8
+        out = self.block3(out)    # 8x8 -> 4x4
+        # 第四个块不进行下采样（保持4x4）
+        out = self.block4(out, downsample=False)
+        out = self.relu(out)
+        # 将特征图展平为向量
+        out = out.view(-1, self.disc_ch*16*4*4)
+        # 通过线性层得到无条件的判别分数
+        output1 = torch.squeeze(self.snlinear1(out))
+        # 条件投影：将标签嵌入经过全连接层后与展平特征逐元素相乘，再求和得到条件分数
+        h_labels = self.sn_embedding1(labels)  # (B, disc_ch*16*4*4)
+        proj = torch.mul(out, h_labels)
+        output2 = torch.sum(proj, dim=[1])
+        # 最终输出为两部分分数之和
+        output = output1 + output2
+        return output
+
+
+# -----------------------------
+# 测试部分：构建生成器和判别器，并进行前向传播测试与参数统计
+if __name__ == "__main__":
+    # 辅助函数，统计网络中参数总数及可训练参数数目
+    def get_parameter_number(net):
+        total_num = sum(p.numel() for p in net.parameters())
+        trainable_num = sum(p.numel() for p in net.parameters() if p.requires_grad)
+        return {'Total': total_num, 'Trainable': trainable_num}
+
+    # 初始化生成器，噪声维度为256，标签嵌入维度128，生成器基础通道64
+    netG = CcGAN_SAGAN_Generator(dim_z=256, dim_embed=128, gene_ch=64).cuda()  # 参数约131M
+
+    netG_student = CcGAN_SAGAN_Generator_Student(dim_z=256, dim_embed=128, gene_ch=32).cuda()  # 参数约33M
+    # 初始化判别器，标签嵌入维度128，判别器基础通道64
+    netD = CcGAN_SAGAN_Discriminator(dim_embed=128, disc_ch=64).cuda()  # 参数约162M
+
+    # 若需要使用多GPU训练，可取消以下注释
+    # netG = nn.DataParallel(netG)
+    # netD = nn.DataParallel(netD)
+
+    # N = 4  # 测试批次大小
+    # z = torch.randn(N, 256).cuda()  # 随机生成噪声向量
+    # y = torch.randn(N, 128).cuda()   # 随机生成标签嵌入
+    # x = netG(z, y,return_features=False)  # 生成图像
+    # o = netG_student(z, y,return_features=False)
+    # print(x.size())  # 输出生成图像尺寸
+    # print(o.size())  # 输出判别器输出尺寸
+    # # 打印生成器和判别器的参数统计信息
+    # print('G:', get_parameter_number(netG))
+    # print('G_s:', get_parameter_number(netG_student))
+# 测试代码
+# gene_ch = 32
+# dim_z = 256
+# dim_embed = 128
+# netG_student = CcGAN_SAGAN_Generator_Student(dim_z, dim_embed, gene_ch=gene_ch)
+
+# # 随机输入
+# z = torch.randn(1, dim_z)
+# labels = torch.randn(1, dim_embed)
+
+# # 前向传播
+# fake, features = netG_student(z, labels, return_features=True)
+# print(f"Block1 输出通道数: {features[0].shape[1]}")  # 应为 512 → 256（错误时显示 512）
